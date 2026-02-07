@@ -36,6 +36,9 @@ contract AgentSpendingLimit is IHook {
     /// @notice Number of token limits configured per account
     mapping(address account => uint256) public limitCount;
 
+    /// @notice Reentrancy lock: true when hook is executing (preCheck→postCheck)
+    mapping(address account => bool) public hookExecuting;
+
     /// @notice Token limit data: limitData[index][account]
     mapping(uint256 index => mapping(address account => TokenLimit)) public limitData;
 
@@ -58,6 +61,7 @@ contract AgentSpendingLimit is IHook {
     error AlreadyInstalled();
     error NotInstalled();
     error NoEtherAccepted();
+    error ReentrantCall();
 
     // ═══════════════════════════════════════════════════════════════
     //                     MODULE LIFECYCLE
@@ -84,7 +88,9 @@ contract AgentSpendingLimit is IHook {
     }
 
     /// @notice Uninstall the hook, clearing all limit data
+    /// @dev Cannot be called during hook execution (prevents bypass via batch uninstall)
     function onUninstall(bytes calldata) external payable override {
+        if (hookExecuting[msg.sender]) revert ReentrantCall();
         uint256 count = limitCount[msg.sender];
         if (count == 0) revert NotInstalled();
 
@@ -108,7 +114,7 @@ contract AgentSpendingLimit is IHook {
     //                      HOOK EXECUTION
     // ═══════════════════════════════════════════════════════════════
 
-    /// @notice Called before each transaction — snapshots balances
+    /// @notice Called before each transaction — snapshots balances and locks
     function preCheck(
         address,
         uint256,
@@ -116,6 +122,9 @@ contract AgentSpendingLimit is IHook {
     ) external payable override returns (bytes memory) {
         uint256 count = limitCount[msg.sender];
         if (count == 0) return "";
+
+        // Lock to prevent topUp/onUninstall during execution
+        hookExecuting[msg.sender] = true;
 
         uint256[] memory balances = new uint256[](count);
         for (uint256 i = 0; i < count; i++) {
@@ -134,7 +143,7 @@ contract AgentSpendingLimit is IHook {
         return abi.encode(balances);
     }
 
-    /// @notice Called after each transaction — enforces limits
+    /// @notice Called after each transaction — enforces limits and unlocks
     /// @dev Uses 1-param postCheck signature (Kernel v3.3 compatible)
     function postCheck(bytes calldata hookData) external payable override {
         uint256 count = limitCount[msg.sender];
@@ -170,6 +179,9 @@ contract AgentSpendingLimit is IHook {
             lim.allowance -= spent;
             emit SpendRecorded(msg.sender, lim.token, spent, lim.allowance);
         }
+
+        // Unlock after enforcement
+        hookExecuting[msg.sender] = false;
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -177,8 +189,10 @@ contract AgentSpendingLimit is IHook {
     // ═══════════════════════════════════════════════════════════════
 
     /// @notice Top up an allowance without reinstalling
-    /// @dev Called by the smart account itself (msg.sender = account)
+    /// @dev Called by the smart account itself (msg.sender = account).
+    ///      Cannot be called during hook execution (prevents session key bypass via batch).
     function topUp(uint256 index, uint256 amount) external {
+        if (hookExecuting[msg.sender]) revert ReentrantCall();
         uint256 count = limitCount[msg.sender];
         if (count == 0) revert NotInstalled();
         require(index < count, "Invalid index");

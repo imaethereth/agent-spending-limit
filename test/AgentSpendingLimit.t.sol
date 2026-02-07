@@ -383,6 +383,59 @@ contract AgentSpendingLimitTest is Test {
     }
 
     // ═══════════════════════════════════════════════════════════════
+    //                  REENTRANCY PROTECTION
+    // ═══════════════════════════════════════════════════════════════
+
+    function test_RevertTopUpDuringExecution() public {
+        _installEthLimit(5 ether, 0, 0);
+
+        // Simulate: preCheck called (hook is now locked)
+        vm.prank(agent);
+        hook.preCheck(address(0), 0, "");
+
+        // Now try topUp — should revert because hook is executing
+        vm.prank(agent);
+        vm.expectRevert(AgentSpendingLimit.ReentrantCall.selector);
+        hook.topUp(0, 10 ether);
+
+        // Cleanup: call postCheck to unlock
+        // (balance unchanged, so no spend recorded)
+        vm.prank(agent);
+        hook.postCheck(abi.encode(new uint256[](1)));
+    }
+
+    function test_RevertUninstallDuringExecution() public {
+        _installEthLimit(5 ether, 0, 0);
+
+        vm.prank(agent);
+        hook.preCheck(address(0), 0, "");
+
+        vm.prank(agent);
+        vm.expectRevert(AgentSpendingLimit.ReentrantCall.selector);
+        hook.onUninstall("");
+
+        // Cleanup
+        vm.prank(agent);
+        hook.postCheck(abi.encode(new uint256[](1)));
+    }
+
+    function test_TopUpWorksOutsideExecution() public {
+        _installEthLimit(5 ether, 0, 0);
+
+        _simulateSpend(agent, 3 ether);
+
+        // hookExecuting should be false after postCheck
+        assertFalse(hook.hookExecuting(agent));
+
+        // topUp should work fine
+        vm.prank(agent);
+        hook.topUp(0, 2 ether);
+
+        (,uint256 remaining,,) = hook.getRemainingAllowance(agent, 0);
+        assertEq(remaining, 4 ether);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
     //                      FUZZ TESTS
     // ═══════════════════════════════════════════════════════════════
 

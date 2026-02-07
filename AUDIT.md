@@ -122,6 +122,81 @@ lim.periodStart += periods * lim.periodSeconds;
 
 ---
 
+---
+
+## Kernel Integration Analysis
+
+Traced the full execution flow through Kernel v3.3 (`Kernel.sol`, `HookManager.sol`, `ExecLib.sol`).
+
+### Execution Flow
+
+```
+EntryPoint → Kernel.validateUserOp() → stores hook in executionHook[userOpHash]
+EntryPoint → Kernel.executeUserOp():
+    1. hook.preCheck(msg.sender, value, callData)    ← snapshots balances
+    2. ExecLib.executeDelegatecall(this, callData)    ← ACTUAL EXECUTION
+    3. hook.postCheck(context)                        ← enforces limits
+```
+
+**Key**: Hooks are called via regular `call()` (not `delegatecall`), so `msg.sender` in hook = Kernel account address. ✅ Correct assumption.
+
+### 🔴 CRITICAL: topUp() Callable Between preCheck and postCheck
+
+**The attack vector**: During step 2 (actual execution), the Kernel executes arbitrary calldata via `delegatecall` to itself. If a **batch execution** includes:
+1. Transfer 10 ETH to attacker
+2. Call `hook.topUp(0, 10 ether)` on our hook contract
+
+Then the flow becomes:
+- `preCheck`: snapshots balance = 100 ETH
+- Execution: sends 10 ETH out, then tops up allowance by 10 ETH
+- `postCheck`: sees 90 ETH balance, spent = 10 ETH, but allowance was refreshed by topUp
+
+**This defeats the spending limit entirely.** An agent with a session key could call topUp on the hook as part of a batch, resetting their own allowance before postCheck runs.
+
+**Fix**: `topUp()` must not be callable during hook execution. Options:
+1. Add a reentrancy guard (lock during preCheck→postCheck)
+2. Restrict topUp to only be callable through a specific validator (e.g., root validator only)
+3. Remove topUp entirely and require reinstall to change allowances
+
+**Severity**: CRITICAL — completely bypasses spending limits if attacker can batch transactions
+
+---
+
+### 🟡 MEDIUM: executeUserOp Uses delegatecall
+
+`Kernel.executeUserOp()` calls `ExecLib.executeDelegatecall(address(this), callData)`. This means the execution runs in the Kernel's context. The hook's preCheck/postCheck run via external calls, so storage is isolated. However:
+
+The `delegatecall` means the Kernel could theoretically execute code that modifies its own storage to change the hook address mid-execution. This is a Kernel-level concern, not specific to our hook, but worth noting.
+
+**Impact on us**: None directly — our hook's storage is separate.
+
+---
+
+### 🟡 MEDIUM: Hook Doesn't Inspect callData
+
+Our `preCheck` ignores the `msgData` parameter entirely. It could inspect the calldata to:
+- Detect if the batch includes a call to `topUp()` on itself
+- Detect if the batch includes calls to `onUninstall()`
+- Block specific function selectors
+
+**Recommendation**: Consider adding calldata inspection in preCheck to detect self-referential calls to the hook contract.
+
+---
+
+### 🟢 LOW: No Protection Against Hook Removal Mid-Session
+
+If the Kernel owner removes the hook (via `uninstallModule`), the hook's `onUninstall` is called which clears all limits. A compromised session key that has permission to manage modules could remove the hook entirely.
+
+**Impact**: Session key scope — if session keys can call `installModule`/`uninstallModule`, they can bypass any hook. This is a Kernel configuration concern (session keys should not have module management permissions).
+
+---
+
+### 🟢 LOW: entryPoint msg.sender in preCheck
+
+In the `executeUserOp` flow, `msg.sender` passed to `preCheck` is the EntryPoint address (since Kernel is called by EntryPoint). Our hook ignores this parameter, which is fine — we only use `msg.sender` (= Kernel address) for storage lookups, not the `msgSender` parameter.
+
+---
+
 ## Methodology
 
 Trail of Bits building-secure-contracts framework:
