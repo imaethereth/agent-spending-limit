@@ -57,6 +57,7 @@ contract AgentSpendingLimit is IHook {
     error ExceedsPerTxLimit(address token, uint256 spent, uint256 maxPerTx);
     error AlreadyInstalled();
     error NotInstalled();
+    error NoEtherAccepted();
 
     // ═══════════════════════════════════════════════════════════════
     //                     MODULE LIFECYCLE
@@ -232,6 +233,16 @@ contract AgentSpendingLimit is IHook {
     }
 
     // ═══════════════════════════════════════════════════════════════
+    //                     ETH REJECTION
+    // ═══════════════════════════════════════════════════════════════
+
+    /// @notice Reject any ETH sent directly to this contract
+    /// @dev Prevents locked ether. The hook contract itself should never hold funds.
+    receive() external payable {
+        revert NoEtherAccepted();
+    }
+
+    // ═══════════════════════════════════════════════════════════════
     //                       INTERNALS
     // ═══════════════════════════════════════════════════════════════
 
@@ -240,7 +251,10 @@ contract AgentSpendingLimit is IHook {
         if (lim.periodSeconds == 0) return;
         if (block.timestamp < lim.periodStart + lim.periodSeconds) return;
 
-        // Calculate how many full periods have elapsed and advance
+        // Calculate how many full periods have elapsed and snap to boundary
+        // Note: divide-before-multiply is intentional here — we want to truncate
+        // partial periods and align periodStart to the nearest period boundary.
+        // slither-disable-next-line divide-before-multiply
         uint256 elapsed = block.timestamp - lim.periodStart;
         uint256 periods = elapsed / lim.periodSeconds;
         lim.periodStart += periods * lim.periodSeconds;
